@@ -107,7 +107,11 @@ void NiceBidiWiFi::loop() {
   // 8. Time-based position estimation during movement (fallback when encoder unavailable)
   if (this->device_found_ && this->init_complete_ &&
       (this->operation_state_ == STA_OPENING || this->operation_state_ == STA_CLOSING)) {
-    this->estimate_time_based_position_();
+    bool encoder_stale = this->last_encoder_update_time_ == 0 ||
+                         (now - this->last_encoder_update_time_ > T4_ENCODER_FRESH_MS);
+    if (encoder_stale) {
+      this->estimate_time_based_position_();
+    }
   }
 
   // 9. Update status LEDs (~20Hz for smooth blink patterns)
@@ -388,8 +392,9 @@ void NiceBidiWiFi::confirm_position_from_io_(uint8_t io_byte) {
     ESP_LOGD(TAG, "Position confirmed: CLOSED via limit switch");
     this->notify_state_change_();
   } else if (limit_open && this->operation_state_ == STA_OPENED) {
-    // Confirmed fully open
-    this->pos_current_ = this->pos_open_;
+    // Confirmed fully open — use REG_POS_MAX (0x18), not REG_MAX_OPN (0x12)
+    uint16_t open_limit = this->pos_max_ != 0 ? this->pos_max_ : this->pos_open_;
+    this->pos_current_ = open_limit;
     ESP_LOGD(TAG, "Position confirmed: OPEN via limit switch");
     this->notify_state_change_();
   }
@@ -418,7 +423,7 @@ void NiceBidiWiFi::handle_movement_transition_(uint8_t old_state, uint8_t new_st
         // Check deviation from existing value
         if (this->last_open_duration_ms_ == 0 ||
             std::abs(static_cast<float>(duration) - static_cast<float>(this->last_open_duration_ms_)) /
-            static_cast<float>(this->last_open_duration_ms_) <= T4_LEARNING_DEVIATION + 0.5f) {
+            static_cast<float>(this->last_open_duration_ms_) <= T4_LEARNING_DEVIATION) {
           this->last_open_duration_ms_ = duration;
           ESP_LOGI(TAG, "Learned open duration: %u ms", duration);
           this->save_learned_timings_();
@@ -426,7 +431,7 @@ void NiceBidiWiFi::handle_movement_transition_(uint8_t old_state, uint8_t new_st
       } else if (old_state == STA_CLOSING && new_state == STA_CLOSED) {
         if (this->last_close_duration_ms_ == 0 ||
             std::abs(static_cast<float>(duration) - static_cast<float>(this->last_close_duration_ms_)) /
-            static_cast<float>(this->last_close_duration_ms_) <= T4_LEARNING_DEVIATION + 0.5f) {
+            static_cast<float>(this->last_close_duration_ms_) <= T4_LEARNING_DEVIATION) {
           this->last_close_duration_ms_ = duration;
           ESP_LOGI(TAG, "Learned close duration: %u ms", duration);
           this->save_learned_timings_();
@@ -450,8 +455,10 @@ void NiceBidiWiFi::handle_movement_transition_(uint8_t old_state, uint8_t new_st
 }
 
 void NiceBidiWiFi::get_effective_pos_limits_(uint16_t *out_open, uint16_t *out_close) const {
-  if (this->pos_open_ != this->pos_close_) {
-    *out_open = this->pos_open_;
+  // Position % uses REG_POS_MAX (0x18) for the open endpoint; REG_MAX_OPN (0x12) is partial-open reference.
+  uint16_t open_limit = this->pos_max_ != 0 ? this->pos_max_ : this->pos_open_;
+  if (open_limit != this->pos_close_) {
+    *out_open = open_limit;
     *out_close = this->pos_close_;
   } else {
     *out_open = 2048;
@@ -566,7 +573,7 @@ void NiceBidiWiFi::parse_packet_(const T4RxPacket &packet) {
     }
 
     uint8_t response_type = d[11];  // run_cmd echo
-    uint8_t next_data = d[12];
+    uint8_t next_data = d[13];    // continuation offset (d[12] is value length)
 
     // Check response type
     // GET response: run_cmd was 0x99, response is 0x99-0x80=0x19 or 0x99-0x81=0x18
@@ -793,16 +800,15 @@ void NiceBidiWiFi::parse_evt_packet_(const std::vector<uint8_t> &d) {
 
       case REG_DIAG_IO:
         ESP_LOGV(TAG, "Diagnostic I/O data received (%d bytes)", data_len);
-        // Parse limit switch states from data byte at offset 16 (d[14+2] = d[16])
-        if (d.size() > 16) {
-          uint8_t io_byte = d[16];
+        // I/O byte: payload[2] when len>=3, else payload[0] (matches homeassistant_nice)
+        if (data_len >= 1 && d.size() > 14) {
+          uint8_t io_byte = (data_len >= 3 && d.size() > 16) ? d[16] : d[14];
           if (this->limit_close_sensor_ != nullptr)
             this->limit_close_sensor_->publish_state((io_byte & 0x01) != 0);
           if (this->limit_open_sensor_ != nullptr)
             this->limit_open_sensor_->publish_state((io_byte & 0x02) != 0);
           if (this->photocell_sensor_ != nullptr)
             this->photocell_sensor_->publish_state((io_byte & 0x04) != 0);
-          // Use limit switches to confirm position
           this->confirm_position_from_io_(io_byte);
         }
         break;
