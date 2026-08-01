@@ -37,7 +37,7 @@ class T4Bus {
   bool ready_to_send() const;
 
  protected:
-  uart_port_t uart_port_{UART_NUM_2};
+  uart_port_t uart_port_{UART_NUM_1};
 
   // RX state machine
   T4RxState rx_state_{RX_WAIT_SYNC};
